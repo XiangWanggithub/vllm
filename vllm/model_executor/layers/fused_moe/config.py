@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+        HadamardRotationConfig,
+    )
 
 import torch
 
@@ -195,6 +202,9 @@ class FusedMoEQuantConfig:
     _a2: FusedMoEQuantDesc
     _w1: FusedMoEQuantDesc
     _w2: FusedMoEQuantDesc
+
+    # Optional Hadamard rotation config for activation pre-processing.
+    hadamard_config: HadamardRotationConfig | None = field(default=None)
 
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
@@ -421,7 +431,8 @@ class FusedMoEQuantConfig:
         w1_zp: torch.Tensor | None = None,
         w2_zp: torch.Tensor | None = None,
         weight_dtype: torch.dtype | str | None = None,
-    ) -> "FusedMoEQuantConfig":
+        hadamard_config: HadamardRotationConfig | None = None,
+    ) -> FusedMoEQuantConfig:
         """
         General builder function for a FusedMoEQuantConfig.
         - quant_dtype: Optional quantization type. None if activations are
@@ -474,6 +485,7 @@ class FusedMoEQuantConfig:
             _w2=FusedMoEQuantDesc(
                 weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
             ),
+            hadamard_config=hadamard_config,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant
@@ -495,6 +507,7 @@ def fp8_w8a8_moe_quant_config(
     g2_alphas: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    hadamard_config: HadamardRotationConfig | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for fp8 activations and fp8 weights.
@@ -514,6 +527,7 @@ def fp8_w8a8_moe_quant_config(
         block_shape=block_shape,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        hadamard_config=hadamard_config,
     )
 
 

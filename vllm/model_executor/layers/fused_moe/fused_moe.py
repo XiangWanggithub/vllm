@@ -5,6 +5,7 @@
 import functools
 import json
 import os
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -57,6 +58,10 @@ from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_newer
 
 logger = init_logger(__name__)
+
+# Thread-local storage for passing Hadamard w2 rotation group size
+# through the custom_op boundary (whose signatures cannot be changed).
+_hadamard_tls = threading.local()
 
 
 @triton.jit
@@ -1590,6 +1595,15 @@ def fused_experts(
         quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
     use_fp8_w8a8 = quant_config.use_fp8_w8a8
 
+    # Apply Hadamard rotation to input activations before first matmul.
+    if (quant_config.hadamard_config is not None
+            and quant_config.hadamard_config.enabled):
+        from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+            hadamard_rotate,
+        )
+        hidden_states = hadamard_rotate(
+            hidden_states, quant_config.hadamard_config.group_size)
+
     # For now, disable DeepGemm for small N (<= 512) until better
     # permute/unpermute ops are available.
     # However, on B200, we use DeepGemm for all cases because they only support
@@ -1637,7 +1651,15 @@ def fused_experts(
             topk_ids=topk_ids,
         )
     else:
-        return dispatch_fused_experts_func(inplace)(
+        # Set w2 rotation group size via TLS so fused_experts_impl can
+        # apply it between the activation function and the second matmul.
+        hcfg = quant_config.hadamard_config
+        if hcfg is not None and hcfg.enabled and hcfg.rotate_w2:
+            _hadamard_tls.w2_group_size = hcfg.w2_group_size
+        else:
+            _hadamard_tls.w2_group_size = 0
+
+        result = dispatch_fused_experts_func(inplace)(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -1663,6 +1685,9 @@ def fused_experts(
             w1_bias=quant_config.w1_bias,
             w2_bias=quant_config.w2_bias,
         )
+
+        _hadamard_tls.w2_group_size = 0
+        return result
 
 
 SILU_NO_MUL: str = activation_without_mul("silu")
@@ -1939,6 +1964,16 @@ def fused_experts_impl(
             intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
+
+        # Apply Hadamard rotation to intermediate activations before
+        # second matmul (when rotate_w2 is enabled).
+        w2_gs = getattr(_hadamard_tls, 'w2_group_size', 0)
+        if w2_gs > 0:
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                hadamard_rotate,
+            )
+            intermediate_cache2 = hadamard_rotate(
+                intermediate_cache2, w2_gs)
 
         qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
             A=intermediate_cache2,

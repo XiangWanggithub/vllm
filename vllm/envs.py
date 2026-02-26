@@ -236,6 +236,9 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
+    VLLM_FP8_HADAMARD_ROTATION: bool = False
+    VLLM_FP8_HADAMARD_GROUP_SIZE: int = 64
+    VLLM_FP8_HADAMARD_ROTATE_W2: bool = False
 
 
 def get_default_cache_root():
@@ -1549,6 +1552,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to enable v2 model runner.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
+    ),
+    # Enable Hadamard rotation for FP8 MoE quantization.
+    "VLLM_FP8_HADAMARD_ROTATION": lambda: bool(
+        int(os.getenv("VLLM_FP8_HADAMARD_ROTATION", "0"))
+    ),
+    # Group size for Hadamard rotation (must be power-of-2).
+    "VLLM_FP8_HADAMARD_GROUP_SIZE": lambda: int(
+        os.getenv("VLLM_FP8_HADAMARD_GROUP_SIZE", "64")
+    ),
+    # Also apply Hadamard rotation to the second MoE matmul.
+    "VLLM_FP8_HADAMARD_ROTATE_W2": lambda: bool(
+        int(os.getenv("VLLM_FP8_HADAMARD_ROTATE_W2", "0"))
     ),
 }
 

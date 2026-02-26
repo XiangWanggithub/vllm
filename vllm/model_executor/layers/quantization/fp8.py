@@ -936,6 +936,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # If checkpoint is fp16, quantize in place.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
+            # Apply Hadamard rotation to weights before FP8 quantization.
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                get_hadamard_config_from_env,
+                rotate_moe_weights,
+            )
+            hadamard_config = get_hadamard_config_from_env()
+            if hadamard_config.enabled:
+                w13_rot, w2_rot = rotate_moe_weights(
+                    layer.w13_weight.data, layer.w2_weight.data,
+                    hadamard_config,
+                )
+                layer.w13_weight = torch.nn.Parameter(
+                    w13_rot, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(
+                    w2_rot, requires_grad=False)
+
             fp8_dtype = current_platform.fp8_dtype()
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
@@ -1164,6 +1180,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.use_marlin:
             return None
 
+        from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+            _largest_pow2_divisor,
+            get_hadamard_config_from_env,
+        )
+        hadamard_config = get_hadamard_config_from_env()
+        if (hadamard_config.enabled and hadamard_config.rotate_w2
+                and hadamard_config.w2_group_size == 0):
+            inter_dim = layer.w2_weight.shape[-1]
+            hadamard_config.w2_group_size = _largest_pow2_divisor(
+                inter_dim, hadamard_config.group_size)
+
         return fp8_w8a8_moe_quant_config(
             w1_scale=(
                 layer.w13_weight_scale_inv
@@ -1178,6 +1205,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.weight_block_size,
             w1_bias=getattr(layer, "w13_bias", None),
             w2_bias=getattr(layer, "w2_bias", None),
+            hadamard_config=hadamard_config if hadamard_config.enabled else None,
         )
 
     @property
