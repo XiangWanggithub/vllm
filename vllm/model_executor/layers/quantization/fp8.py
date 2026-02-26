@@ -442,6 +442,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
+        layer.hadamard_group_size = 0
 
         if self.block_quant:
             assert self.weight_block_size is not None
@@ -527,6 +528,28 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # If checkpoint not serialized fp8, quantize the weights.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
+            # Apply Hadamard rotation before FP8 quantization if enabled.
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                _largest_pow2_divisor,
+                get_hadamard_config_from_env,
+                hadamard_rotate,
+            )
+            hadamard_config = get_hadamard_config_from_env()
+            if hadamard_config.enabled:
+                K = layer.weight.shape[1]  # weight is [N, K]
+                gs = _largest_pow2_divisor(K, hadamard_config.group_size)
+                layer.weight.data.copy_(
+                    hadamard_rotate(
+                        layer.weight.data.to(torch.bfloat16), gs
+                    ).to(layer.weight.data.dtype)
+                )
+                layer.hadamard_group_size = gs
+                logger.info(
+                    "Hadamard rotation applied to linear weight "
+                    "(shape=%s, group_size=%d)",
+                    layer.weight.shape, gs,
+                )
+
             qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
             weight = qweight.t()
 
@@ -642,6 +665,8 @@ class Fp8LinearMethod(LinearMethodBase):
             out_dtype=self.out_dtype,
             input_scale=layer.input_scale,
             bias=bias,
+            hadamard_group_size=getattr(
+                layer, 'hadamard_group_size', 0),
         )
 
 

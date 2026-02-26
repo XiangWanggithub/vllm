@@ -442,6 +442,7 @@ class Fp8LinearOp:
         input_scale: torch.Tensor | None = None,
         input_scale_ub: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
+        hadamard_group_size: int = 0,
     ) -> torch.Tensor:
         # ops.scaled_fp8_quant supports both dynamic and static quant.
         #   If dynamic, layer.input_scale is None and x_scale computed from x.
@@ -453,6 +454,13 @@ class Fp8LinearOp:
 
         if out_dtype is None:
             out_dtype = input.dtype
+
+        # Apply Hadamard rotation to activations before FP8 quantization
+        if hadamard_group_size > 0:
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                hadamard_rotate,
+            )
+            input_2d = hadamard_rotate(input_2d, hadamard_group_size)
 
         # If input not quantized
         # TODO(luka) remove this path if not used anymore
