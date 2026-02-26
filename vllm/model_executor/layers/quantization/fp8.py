@@ -759,6 +759,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+        # BIASES (e.g. GPT-OSS MoE layers have biases)
+        # Biases must always use the original dtype (not FP8).
+        if self.moe.has_bias:
+            w13_bias = torch.nn.Parameter(
+                torch.zeros(num_experts,
+                            2 * intermediate_size_per_partition,
+                            dtype=layer.orig_dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+
+            w2_bias = torch.nn.Parameter(
+                torch.zeros(num_experts, hidden_size,
+                            dtype=layer.orig_dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+
         # WEIGHT_SCALES
         if not self.block_quant:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -1156,6 +1176,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
         )
 
     @property

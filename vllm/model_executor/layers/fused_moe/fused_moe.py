@@ -518,11 +518,8 @@ def fused_moe_kernel(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    if HAS_BIAS:
-        accumulator = accumulator + bias[None, :]
-    if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-        accumulator = accumulator * moe_weight[:, None]
+    # Apply dequantization scales BEFORE adding bias, so the bias
+    # is not incorrectly scaled by the quantization factors.
     if use_int8_w8a16:
         accumulator = (accumulator * b_scale).to(compute_type)
     elif use_fp8_w8a8 or use_int8_w8a8:
@@ -532,6 +529,11 @@ def fused_moe_kernel(
             accumulator = (accumulator * a_scale * b_scale).to(compute_type)
     else:
         accumulator = accumulator.to(compute_type)
+    if HAS_BIAS:
+        accumulator = accumulator + bias[None, :]
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
 
     # -----------------------------------------------------------
     # Write back the block of the output
