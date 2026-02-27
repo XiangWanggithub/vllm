@@ -202,6 +202,7 @@ class Attention(nn.Module, AttentionLayerBase):
             sliding_window = None
 
         vllm_config = get_current_vllm_config()
+        self.fake_quant = False
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
             block_size = cache_config.block_size
@@ -210,6 +211,9 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dtype = "auto"
             block_size = 16
             calculate_kv_scales = False
+        if kv_cache_dtype == "hif8_fake":
+            self.fake_quant = True
+            kv_cache_dtype = "auto"
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
         )
@@ -354,6 +358,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size)
+            if self.fake_quant:
+                key, value = self.quant_method.apply(key, value)
             if self.use_direct_call:
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata

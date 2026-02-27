@@ -366,6 +366,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
+    use_hif8_w8a8_fake: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
@@ -480,6 +481,21 @@ def fused_moe_kernel(
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
+    if use_hif8_w8a8_fake:
+        # channel-wise
+        if per_channel_quant:
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            # Load per-token scale for activations
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+        # tensor-wise
+        else:
+            a_scale = tl.load(a_scale_ptr)
+            b_scale = tl.load(b_scale_ptr + off_experts)
+
     if HAS_BIAS:
         # bias shape: [num_experts, N]
         bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn * stride_bbn
@@ -532,6 +548,8 @@ def fused_moe_kernel(
             accumulator = accumulator.to(compute_type)
         else:
             accumulator = (accumulator * a_scale * b_scale).to(compute_type)
+    elif use_hif8_w8a8_fake:
+        accumulator = (accumulator * a_scale * b_scale).to(compute_type)
     else:
         accumulator = accumulator.to(compute_type)
     if HAS_BIAS:
@@ -564,6 +582,7 @@ def invoke_fused_moe_kernel(
     config: dict[str, Any],
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,
+    use_hif8_w8a8_fake: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
@@ -585,6 +604,9 @@ def invoke_fused_moe_kernel(
         ) == B_scale.size(-1)
 
     elif use_int8_w8a16 or use_int4_w4a16:
+        assert B_scale is not None
+        assert block_shape is None or block_shape[0] == 0
+    elif use_hif8_w8a8_fake:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
@@ -732,6 +754,7 @@ def invoke_fused_moe_kernel(
             top_k=top_k,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
+            use_hif8_w8a8_fake=use_hif8_w8a8_fake,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
@@ -1375,6 +1398,7 @@ def inplace_fused_experts(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
+    use_hif8_w8a8_fake: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
@@ -1402,6 +1426,7 @@ def inplace_fused_experts(
         activation,
         apply_router_weight_on_input,
         use_fp8_w8a8,
+        use_hif8_w8a8_fake,
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
@@ -1430,6 +1455,7 @@ def inplace_fused_experts_fake(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
+    use_hif8_w8a8_fake: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
@@ -1472,6 +1498,7 @@ def outplace_fused_experts(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
+    use_hif8_w8a8_fake: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
@@ -1499,6 +1526,7 @@ def outplace_fused_experts(
         activation,
         apply_router_weight_on_input,
         use_fp8_w8a8,
+        use_hif8_w8a8_fake,
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
@@ -1526,6 +1554,7 @@ def outplace_fused_experts_fake(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
+    use_hif8_w8a8_fake: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
@@ -1668,6 +1697,7 @@ def fused_experts(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_fp8_w8a8=quant_config.use_fp8_w8a8,
+            use_hif8_w8a8_fake=quant_config.use_hif8_w8a8_fake,
             use_int8_w8a8=quant_config.use_int8_w8a8,
             use_int8_w8a16=quant_config.use_int8_w8a16,
             use_int4_w4a16=quant_config.use_int4_w4a16,
@@ -1730,6 +1760,7 @@ def fused_experts_impl(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
+    use_hif8_w8a8_fake: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
@@ -1804,6 +1835,11 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         ocp_mx_scheme=ocp_mx_scheme,
     )
+
+    if use_hif8_w8a8_fake:
+        # (TODO:wangxiang) Special case for hif8 fake quant for now. Could be improved.
+        config_dtype = None
+        quant_dtype = "hif8_fake"
 
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
@@ -1933,6 +1969,7 @@ def fused_experts_impl(
             config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
+            use_hif8_w8a8_fake=use_hif8_w8a8_fake,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
@@ -1999,6 +2036,7 @@ def fused_experts_impl(
             config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
+            use_hif8_w8a8_fake=use_hif8_w8a8_fake,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,

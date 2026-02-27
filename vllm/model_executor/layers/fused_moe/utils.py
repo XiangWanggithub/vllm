@@ -26,6 +26,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import flashinfer_fp4_quantize
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+from vllm.model_executor.layers.quantization.input_quant_hif8_fake import scaled_hif8_quant
 
 
 @triton.jit
@@ -146,6 +147,26 @@ def _fp8_quantize(
 
     return A, A_scale
 
+def _hif8_fake_quantize(
+    A: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    per_act_token: bool,
+    block_shape: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perform hif8 quantization on the inputs.  If a block_shape
+    is provided, the output will be blocked.
+    """
+    if block_shape is None:
+        # TODO(wangxiang): use QuantFakeHiF8 custom op
+        A, A_scale = scaled_hif8_quant(
+            A, A_scale, use_per_token_if_dynamic=per_act_token
+        )
+    else:
+        raise NotImplementedError("Per block quant is not supported yet.")
+
+    return A, A_scale
+
 
 def _int8_quantize(
     A: torch.Tensor,
@@ -246,6 +267,8 @@ def moe_kernel_quantize_input(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if quant_dtype == torch.float8_e4m3fn:
         return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+    elif quant_dtype == "hif8_fake":
+        return _hif8_fake_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == torch.int8:
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == "nvfp4":

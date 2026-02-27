@@ -317,6 +317,10 @@ class FusedMoEQuantConfig:
         return self._w2.alpha_or_gscale
 
     @property
+    def use_hif8_w8a8_fake(self) -> bool:
+        return self.quant_dtype == "hif8_fake"
+
+    @property
     def use_fp8_w8a8(self) -> bool:
         return self.quant_dtype == torch.float8_e4m3fn
 
@@ -458,6 +462,7 @@ class FusedMoEQuantConfig:
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
+            "hif8_fake",
             "nvfp4",
             "mxfp4",
             "mxfp6_e3m2",
@@ -492,6 +497,40 @@ class FusedMoEQuantConfig:
         assert quant_config.block_shape == block_shape
         return quant_config
 
+def hif8_w8a8_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    per_act_token_quant: bool = False,
+    per_out_ch_quant: bool = False,
+    block_shape: list[int] | None = None,
+    a1_gscale: torch.Tensor | None = None,
+    a2_gscale: torch.Tensor | None = None,
+    g1_alphas: torch.Tensor | None = None,
+    g2_alphas: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+) -> FusedMoEQuantConfig:
+    """
+    Construct a quant config for fp8 activations and fp8 weights.
+    """
+    return FusedMoEQuantConfig.make(
+        "hif8_fake",
+        w1_scale=w1_scale,
+        g1_alphas=g1_alphas,
+        w2_scale=w2_scale,
+        g2_alphas=g2_alphas,
+        a1_scale=a1_scale,
+        a1_gscale=a1_gscale,
+        a2_scale=a2_scale,
+        a2_gscale=a2_gscale,
+        per_act_token_quant=per_act_token_quant,
+        per_out_ch_quant=per_out_ch_quant,
+        block_shape=block_shape,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+    )
 
 def fp8_w8a8_moe_quant_config(
     w1_scale: torch.Tensor,

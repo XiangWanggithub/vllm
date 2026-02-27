@@ -15,6 +15,7 @@ QuantizationMethods = Literal[
     "fp8",
     "ptpc_fp8",
     "fbgemm_fp8",
+    "hif8_fake",
     "fp_quant",
     "modelopt",
     "modelopt_fp4",
@@ -114,6 +115,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
+    from .hif8_fake import HiF8FakeConfig
     from .fp_quant import FPQuantConfig
     from .gguf import GGUFConfig
     from .gptq import GPTQConfig
@@ -138,6 +140,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "tpu_int8": Int8TpuConfig,
         "fp8": Fp8Config,
         "fbgemm_fp8": FBGEMMFp8Config,
+        "hif8_fake": HiF8FakeConfig,
         "fp_quant": FPQuantConfig,
         "modelopt": ModelOptFp8Config,
         "modelopt_fp4": ModelOptNvFp4Config,
