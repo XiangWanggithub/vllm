@@ -524,11 +524,11 @@ class HiF8FakeLinearMethod(LinearMethodBase):
         # Otherwise, wait until process_weights_after_loading.
         if self.quant_config.is_checkpoint_hif8_serialized:
             scale = ChannelQuantScaleParameter(
-                data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
+                data=torch.empty(sum(output_partition_sizes), dtype=torch.float32),
                 output_dim=0,
                 weight_loader=weight_loader,
             )
-            raise NotImplementedError("Loading HiF8 weights is not supported.")
+            layer.register_parameter("weight_scale", scale)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         size_k_first = True
@@ -658,8 +658,6 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
-        if self.quant_config.is_checkpoint_hif8_serialized:
-            raise NotImplementedError("Real HiF8 is not supported.")
         if self.block_quant:
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
@@ -734,19 +732,7 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_bias, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        if not self.block_quant:
-            # Per-tensor for weight
-            # Allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
-            )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-            )
-            layer.register_parameter("w13_weight_scale", w13_weight_scale)
-            layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        elif not self.block_quant and self.per_channel:
+        if not self.block_quant and self.per_channel:
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
@@ -762,6 +748,18 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
                     dtype=torch.float32,
                 ),
                 requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        elif not self.block_quant:
+            # Per-tensor for weight
+            # Allocate 2 scales for w1 and w3 respectively.
+            # They will be combined to a single scale after weight loading.
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -908,11 +906,25 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
             w2_bias = layer.w2_bias.data.to(torch.float32)
             layer.w13_bias = torch.nn.Parameter(w13_bias, requires_grad=False)
             layer.w2_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
-        # If checkpoint is fp8, we need to handle that the
-        # MoE kernels require single activation scale and single weight
-        # scale for w13 per expert.
+        # If checkpoint is fp8, use loaded weights and scales directly.
         else:
-            raise NotImplementedError("Loading pre-quantized HiF8 is not supported yet.")
+            layer.w13_weight = torch.nn.Parameter(
+                layer.w13_weight.data, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(
+                layer.w2_weight.data, requires_grad=False)
+            # Reshape scales from [E, N] to [E, N, 1] for broadcasting.
+            if layer.w13_weight_scale.dim() == 2:
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    layer.w13_weight_scale.data.unsqueeze(-1),
+                    requires_grad=False)
+            if layer.w2_weight_scale.dim() == 2:
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    layer.w2_weight_scale.data.unsqueeze(-1),
+                    requires_grad=False)
+            w13_bias = layer.w13_bias.data.to(torch.float32)
+            w2_bias = layer.w2_bias.data.to(torch.float32)
+            layer.w13_bias = torch.nn.Parameter(w13_bias, requires_grad=False)
+            layer.w2_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
 
     def maybe_make_prepare_finalize(
         self,

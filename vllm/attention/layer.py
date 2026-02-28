@@ -211,7 +211,7 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dtype = "auto"
             block_size = 16
             calculate_kv_scales = False
-        if kv_cache_dtype == "hif8_fake":
+        if kv_cache_dtype in ("hif8_fake", "hif8"):
             self.fake_quant = True
             kv_cache_dtype = "auto"
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(

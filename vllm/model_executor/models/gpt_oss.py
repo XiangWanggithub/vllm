@@ -531,7 +531,29 @@ class GptOssModel(nn.Module):
             if is_pp_missing_parameter(name, self):
                 continue
 
-            if ".w13_weight" in name:
+            if ".w13_weight_scale" in name:
+                # Handle MLP gate and up projection weight scales
+                if use_ep:
+                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                else:
+                    narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
+                param = params_dict[name]
+                param.copy_(narrow_weight)
+                loaded_params.add(name)
+                continue
+            elif ".w2_weight_scale" in name:
+                # Handle MLP down projection weight scales
+                # down_proj is row-parallel: output dim (hidden_size) is NOT
+                # sharded, so load scale in full (no TP slicing on output dim).
+                if use_ep:
+                    narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
+                else:
+                    narrow_weight = weight
+                param = params_dict[name]
+                param.copy_(narrow_weight)
+                loaded_params.add(name)
+                continue
+            elif ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
                 # Extract gate and up projection parts
                 if use_ep:
