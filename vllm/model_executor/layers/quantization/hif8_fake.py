@@ -540,7 +540,7 @@ class HiF8FakeLinearMethod(LinearMethodBase):
         # If checkpoint not serialized fp8, quantize the weights.
         elif not self.quant_config.is_checkpoint_hif8_serialized:
             #qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
-            weight, weight_scale = scaled_hif8_quant(layer.weight, scale=None, use_per_token_if_dynamic=self.per_channel, use_wmax=False)
+            weight, weight_scale = scaled_hif8_quant(layer.weight, scale=None, use_per_token_if_dynamic=self.per_channel, use_wmax=True)
             #weight = qweight.t()
 
         # If checkpoint is fp8 per-tensor, handle that there are N scales for N
@@ -895,10 +895,10 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
                 )
             for expert in range(layer.local_num_experts):
                 w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_hif8_quant(layer.w13_weight.data[expert, :, :], use_per_token_if_dynamic=self.per_channel, use_wmax=False)
+                    scaled_hif8_quant(layer.w13_weight.data[expert, :, :], use_per_token_if_dynamic=self.per_channel, use_wmax=True)
                 )
                 w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_hif8_quant(layer.w2_weight.data[expert, :, :], use_per_token_if_dynamic=self.per_channel, use_wmax=False)
+                    scaled_hif8_quant(layer.w2_weight.data[expert, :, :], use_per_token_if_dynamic=self.per_channel, use_wmax=True)
                 )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
