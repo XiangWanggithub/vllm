@@ -255,6 +255,7 @@ class HiF8FakeLinearOp:
         input_scale: torch.Tensor | None = None,
         input_scale_ub: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
+        hadamard_group_size: int = 0,
     ) -> torch.Tensor:
         # ops.scaled_fp8_quant supports both dynamic and static quant.
         #   If dynamic, layer.input_scale is None and x_scale computed from x.
@@ -266,6 +267,13 @@ class HiF8FakeLinearOp:
 
         if out_dtype is None:
             out_dtype = input.dtype
+
+        # Apply Hadamard rotation to activations before HiF8 quantization
+        if hadamard_group_size > 0:
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                hadamard_rotate,
+            )
+            input_2d = hadamard_rotate(input_2d, hadamard_group_size)
 
         # If input not quantized
         if input_scale is None:
@@ -494,6 +502,7 @@ class HiF8FakeLinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
+        layer.hadamard_group_size = 0
 
         if self.block_quant:
             assert self.weight_block_size is not None
@@ -539,7 +548,28 @@ class HiF8FakeLinearMethod(LinearMethodBase):
 
         # If checkpoint not serialized fp8, quantize the weights.
         elif not self.quant_config.is_checkpoint_hif8_serialized:
-            #qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
+            # Apply Hadamard rotation before HiF8 quantization if enabled.
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                _largest_pow2_divisor,
+                get_hadamard_config_from_env,
+                hadamard_rotate,
+            )
+            hadamard_config = get_hadamard_config_from_env()
+            if hadamard_config.enabled:
+                K = layer.weight.shape[1]  # weight is [N, K]
+                gs = _largest_pow2_divisor(K, hadamard_config.group_size)
+                layer.weight.data.copy_(
+                    hadamard_rotate(
+                        layer.weight.data.to(torch.bfloat16), gs
+                    ).to(layer.weight.data.dtype)
+                )
+                layer.hadamard_group_size = gs
+                logger.info(
+                    "Hadamard rotation applied to HiF8 linear weight "
+                    "(shape=%s, group_size=%d)",
+                    layer.weight.shape, gs,
+                )
+
             weight, weight_scale = scaled_hif8_quant(layer.weight, scale=None, use_per_token_if_dynamic=self.per_channel, use_wmax=True)
             #weight = qweight.t()
 
@@ -618,6 +648,8 @@ class HiF8FakeLinearMethod(LinearMethodBase):
             out_dtype=self.out_dtype,
             input_scale=layer.input_scale,
             bias=bias,
+            hadamard_group_size=getattr(
+                layer, 'hadamard_group_size', 0),
         )
 
 
@@ -849,6 +881,22 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
 
         # If checkpoint is fp16, quantize in place.
         elif not self.quant_config.is_checkpoint_hif8_serialized:
+            # Apply Hadamard rotation to weights before HiF8 quantization.
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                get_hadamard_config_from_env,
+                rotate_moe_weights,
+            )
+            hadamard_config = get_hadamard_config_from_env()
+            if hadamard_config.enabled:
+                w13_rot, w2_rot = rotate_moe_weights(
+                    layer.w13_weight.data, layer.w2_weight.data,
+                    hadamard_config,
+                )
+                layer.w13_weight = torch.nn.Parameter(
+                    w13_rot, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(
+                    w2_rot, requires_grad=False)
+
             quantized_dtype = layer.w13_weight.data.dtype
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=quantized_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=quantized_dtype)
@@ -983,6 +1031,17 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
+        from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+            _largest_pow2_divisor,
+            get_hadamard_config_from_env,
+        )
+        hadamard_config = get_hadamard_config_from_env()
+        if (hadamard_config.enabled and hadamard_config.rotate_w2
+                and hadamard_config.w2_group_size == 0):
+            inter_dim = layer.w2_weight.shape[-1]
+            hadamard_config.w2_group_size = _largest_pow2_divisor(
+                inter_dim, hadamard_config.group_size)
+
         return hif8_w8a8_moe_quant_config(
             w1_scale=(
                 layer.w13_weight_scale_inv
@@ -999,6 +1058,7 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
             per_out_ch_quant=self.per_channel,
             w1_bias=layer.w13_bias,
             w2_bias=layer.w2_bias,
+            hadamard_config=hadamard_config if hadamard_config.enabled else None,
         )
 
     @property

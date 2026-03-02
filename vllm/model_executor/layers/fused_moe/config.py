@@ -511,6 +511,7 @@ def hif8_w8a8_moe_quant_config(
     g2_alphas: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    hadamard_config: HadamardRotationConfig | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for fp8 activations and fp8 weights.
@@ -530,6 +531,7 @@ def hif8_w8a8_moe_quant_config(
         block_shape=block_shape,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
+        hadamard_config=hadamard_config,
     )
 
 def fp8_w8a8_moe_quant_config(
