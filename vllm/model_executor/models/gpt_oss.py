@@ -555,7 +555,7 @@ class GptOssModel(nn.Module):
                 continue
             elif ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
-                # Extract gate and up projection parts
+                # gate_up_proj [E, K, 2N] has interleaved gate/up channels
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
