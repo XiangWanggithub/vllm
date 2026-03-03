@@ -114,6 +114,18 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             router_logits=router_logits,
         )
 
+        # Apply Hadamard rotation to input activations before first matmul.
+        # The standard fused_experts() function handles this internally, but
+        # the modular path bypasses it, so we must rotate here.
+        if (self.moe_quant_config is not None
+                and self.moe_quant_config.hadamard_config is not None
+                and self.moe_quant_config.hadamard_config.enabled):
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                hadamard_rotate,
+            )
+            x = hadamard_rotate(
+                x, self.moe_quant_config.hadamard_config.group_size)
+
         result = self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,

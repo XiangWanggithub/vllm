@@ -741,6 +741,19 @@ class NaiveBatchedExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
             self.activation(activation, tmp, input.to(tmp.dtype))
 
+            # Apply Hadamard rotation to intermediate activations before
+            # second matmul (when rotate_w2 is enabled), matching the
+            # standard triton path in fused_moe.py.
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                _hadamard_tls,
+            )
+            w2_gs = getattr(_hadamard_tls, 'w2_group_size', 0)
+            if w2_gs > 0:
+                from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                    hadamard_rotate,
+                )
+                tmp = hadamard_rotate(tmp, w2_gs)
+
             if self.quant_config.is_quantized:
                 assert self.w2_scale is not None
                 w2_dq = self.dequant(w2[expert], self.w2_scale[expert])
@@ -981,6 +994,18 @@ class BatchedTritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             intermediate_cache2.view(-1, N // 2),
             intermediate_cache1.view(-1, N),
         )
+
+        # Apply Hadamard rotation to intermediate activations before w2
+        # matmul, matching the rotation applied to w2 weights offline.
+        if (self.quant_config.hadamard_config is not None
+                and self.quant_config.hadamard_config.enabled
+                and self.quant_config.hadamard_config.w2_group_size > 0):
+            from vllm.model_executor.layers.fused_moe.hadamard_rotation import (
+                hadamard_rotate,
+            )
+            intermediate_cache2 = hadamard_rotate(
+                intermediate_cache2,
+                self.quant_config.hadamard_config.w2_group_size)
 
         qintermediate_cache2, a2q_scale = batched_moe_kernel_quantize_input(
             intermediate_cache2,
