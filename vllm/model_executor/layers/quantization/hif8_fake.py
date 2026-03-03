@@ -896,6 +896,13 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data.copy_(w2_rot)
                 del w13_rot, w2_rot
                 torch.cuda.empty_cache()
+                logger.info(
+                    "Hadamard rotation applied to MoE weights "
+                    "(w13=%s, w2=%s, group_size=%d, w2_group_size=%d)",
+                    layer.w13_weight.shape, layer.w2_weight.shape,
+                    hadamard_config.group_size,
+                    hadamard_config.w2_group_size,
+                )
 
             quantized_dtype = layer.w13_weight.data.dtype
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=quantized_dtype)
