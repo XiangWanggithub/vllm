@@ -28,6 +28,7 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "fp8_fake",
     "hif8",
     "hif8_fake",
 ]

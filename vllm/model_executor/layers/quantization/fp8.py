@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import re
 from collections.abc import Callable
 from enum import Enum
 from functools import partial
@@ -333,6 +335,27 @@ class Fp8Config(QuantizationConfig):
             moe_quant_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
             return moe_quant_method
         elif isinstance(layer, Attention):
+            # MX FP8 fake KV-cache quantization is only meaningful when weights
+            # are also block-quantized (VLLM_FP8_BLOCK_QUANT=1 or a serialized
+            # block-FP8 checkpoint).  Without block quant on the weights, the
+            # model is using traditional per-tensor FP8 — returning
+            # Fp8KVCacheMethod here would silently inject MX FP8 noise into
+            # the KV cache while weights stay at per-tensor precision, giving
+            # an inconsistent mixed-precision setup.
+            block_quant_active = (
+                self.weight_block_size is not None
+                or bool(os.environ.get("VLLM_FP8_BLOCK_QUANT", ""))
+            )
+            if not block_quant_active:
+                return None
+            # For GPT-OSS hybrid attention: even layers use sliding-window
+            # attention (SWA) with a small context window — keep their KV
+            # cache in BF16 to avoid unnecessary quantization of a tiny
+            # buffer. Odd layers use full attention and benefit most from
+            # FP8 KV compression at long context lengths.
+            m = re.search(r'\.layers\.(\d+)\.', prefix) if prefix else None
+            if m is not None and int(m.group(1)) % 2 == 0:
+                return None  # SWA layer — BF16 KV cache
             return Fp8KVCacheMethod(self)
         return None
 
@@ -397,6 +420,12 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_deep_gemm = is_deep_gemm_supported()
 
         self.weight_block_size = self.quant_config.weight_block_size
+        # Allow enabling online block FP8 via env var without a pre-serialized
+        # checkpoint. VLLM_FP8_BLOCK_SIZE=32 matches OCP MX FP8 spec.
+        if (self.weight_block_size is None
+                and os.environ.get("VLLM_FP8_BLOCK_QUANT", "")):
+            _bs = int(os.environ.get("VLLM_FP8_BLOCK_SIZE", "32"))
+            self.weight_block_size = [_bs, _bs]
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
         if self.weight_block_size:
@@ -411,10 +440,17 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             assert not self.act_q_static
             assert self.weight_block_size is not None
+            # CUTLASS block FP8 linear only supports [1, 128] activation scale
+            # groups. Fall back to Triton for other block sizes (e.g. [32, 32]
+            # for strict MX FP8).
+            cutlass_ok = (
+                self.cutlass_block_fp8_supported
+                and self.weight_block_size == [128, 128]
+            )
             self.w8a8_block_fp8_linear = W8A8BlockFp8LinearOp(
                 weight_group_shape=GroupShape(*self.weight_block_size),
                 act_quant_group_shape=self.act_q_group_shape,
-                cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
+                cutlass_block_fp8_supported=cutlass_ok,
                 use_aiter_and_is_supported=self.use_aiter_and_is_supported,
             )
         else:
@@ -515,7 +551,22 @@ class Fp8LinearMethod(LinearMethodBase):
         size_k_first = True
         input_scale = None
         # TODO(rob): refactor block quant into separate class.
-        if self.block_quant:
+        if (self.block_quant
+                and not self.quant_config.is_checkpoint_fp8_serialized):
+            # Online block FP8: compute per-block scales directly from the
+            # BF16 weight loaded from the checkpoint. No calibration needed.
+            assert not self.act_q_static
+            size_k_first = False
+            from vllm.utils.deep_gemm import per_block_cast_to_fp8
+            weight_fp8, weight_scale = per_block_cast_to_fp8(
+                layer.weight.to(torch.bfloat16), self.weight_block_size
+            )
+            weight, weight_scale = process_fp8_weight_block_strategy(
+                weight_fp8, weight_scale
+            )
+
+        elif self.block_quant:
+            # Pre-serialized FP8 checkpoint with block scales.
             assert not self.act_q_static
             size_k_first = False
 
@@ -688,6 +739,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.layer = layer
         self.quant_config = quant_config
         self.weight_block_size = self.quant_config.weight_block_size
+        # Inherit env-var online block FP8 setting (same as Fp8LinearMethod).
+        if (self.weight_block_size is None
+                and os.environ.get("VLLM_FP8_BLOCK_QUANT", "")):
+            _bs = int(os.environ.get("VLLM_FP8_BLOCK_SIZE", "32"))
+            self.weight_block_size = [_bs, _bs]
         self.block_quant: bool = self.weight_block_size is not None
         self.fp8_backend = get_fp8_moe_backend(
             self.block_quant, layer.moe_parallel_config
@@ -699,17 +755,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM:
             self.flashinfer_moe_backend = FlashinferMoeBackend.TENSORRT_LLM
         elif self.fp8_backend == Fp8MoeBackend.FLASHINFER_CUTLASS:
-            self.flashinfer_moe_backend = FlashinferMoeBackend.CUTLASS
-            if self.block_quant:
-                assert self.weight_block_size == [128, 128], (
-                    f"Only support weight_block_size == [128, 128], "
-                    f"got {self.weight_block_size}"
+            if self.block_quant and self.weight_block_size != [128, 128]:
+                # CUTLASS block FP8 for MoE only supports [128, 128].
+                # Fall back to Triton for other block sizes (e.g. [32, 32]
+                # for strict MX FP8).
+                self.fp8_backend = Fp8MoeBackend.TRITON
+            else:
+                self.flashinfer_moe_backend = FlashinferMoeBackend.CUTLASS
+                self.flashinfer_moe_fn = partial(
+                    flashinfer_cutlass_moe_fp8,
+                    moe=self.moe,
+                    use_deepseek_fp8_block_scale=self.block_quant,
                 )
-            self.flashinfer_moe_fn = partial(
-                flashinfer_cutlass_moe_fp8,
-                moe=self.moe,
-                use_deepseek_fp8_block_scale=self.block_quant,
-            )
 
         self.allow_deep_gemm = self.fp8_backend == Fp8MoeBackend.DEEPGEMM
         self.allow_cutlass_block_scaled_grouped_gemm = (
@@ -885,7 +942,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
 
         # TODO (rob): refactor block quant into separate class.
-        if self.block_quant:
+        if (self.block_quant
+                and not self.quant_config.is_checkpoint_fp8_serialized):
+            # Online block FP8 for MoE: compute per-block scales from the
+            # BF16 weights. Uses the Triton backend (no calibration needed).
+            assert self.quant_config.activation_scheme == "dynamic"
+            from vllm.utils.deep_gemm import per_block_cast_to_fp8
+            fp8_dtype = current_platform.fp8_dtype()
+
+            w13_fp8 = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
+            w2_fp8 = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
+            # Scale shapes were pre-allocated in create_weights with ceiling
+            # division; they match the output of per_block_cast_to_fp8.
+            w13_scales = torch.empty_like(layer.w13_weight_scale_inv.data)
+            w2_scales = torch.empty_like(layer.w2_weight_scale_inv.data)
+
+            for expert in range(layer.local_num_experts):
+                w13_q, w13_s = per_block_cast_to_fp8(
+                    layer.w13_weight.data[expert].to(torch.bfloat16),
+                    self.weight_block_size,
+                )
+                w13_fp8[expert] = w13_q
+                w13_scales[expert] = w13_s
+
+                w2_q, w2_s = per_block_cast_to_fp8(
+                    layer.w2_weight.data[expert].to(torch.bfloat16),
+                    self.weight_block_size,
+                )
+                w2_fp8[expert] = w2_q
+                w2_scales[expert] = w2_s
+
+            layer.w13_weight = Parameter(w13_fp8, requires_grad=False)
+            layer.w13_weight_scale_inv = Parameter(w13_scales, requires_grad=False)
+            layer.w2_weight = Parameter(w2_fp8, requires_grad=False)
+            layer.w2_weight_scale_inv = Parameter(w2_scales, requires_grad=False)
+
+        elif self.block_quant:
             assert self.quant_config.activation_scheme == "dynamic"
             if current_platform.is_fp8_fnuz():
                 w13_weight, w13_weight_scale_inv, w13_input_scale = (
@@ -1417,7 +1509,69 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """
     Supports loading kv-cache scaling factors from FP8 checkpoints.
+
+    When used with kv_cache_dtype="fp8_fake", also performs fake FP8
+    quantization of the KV tensors (quantize→dequantize in Python before
+    storing in a BF16 KV cache).  Sink tokens (position < N_SINK_TOKENS)
+    are restored from the original BF16 values to avoid quantization noise
+    on the most-attended tokens.
     """
+
+    # Leading token positions kept at full BF16 precision (attention sinks).
+    # GPT-OSS uses 1 sink token at position 0 across all layers.
+    N_SINK_TOKENS = 1
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+
+    def apply(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale_ub: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ):
+        """Fake FP8 quantization for KV tensors with sink-token protection.
+
+        Simulates the precision loss of FP8 KV storage by quantizing and
+        immediately dequantizing using per-tensor scales.  Sink tokens are
+        left at full BF16 precision via torch.where to remain compatible with
+        torch.compile / CUDA graph capture.
+        """
+        assert len(key.shape) == 3, "Key must be (-1, num_heads, head_dim)"
+        assert len(value.shape) == 3, "Value must be (-1, num_heads, head_dim)"
+
+        has_sinks = positions is not None and self.N_SINK_TOKENS > 0
+        if has_sinks:
+            original_key = key.clone()
+            original_value = value.clone()
+
+        # Strict MX FP8: 32-element blocks with per-block E4M3 scaling.
+        # For head_dim=64 this gives 2 independent scales per (token, head)
+        # pair — matches the OCP MX FP8 specification exactly.
+        fp8_dtype = torch.float8_e4m3fn
+        fp8_max = torch.finfo(fp8_dtype).max  # 448.0 for E4M3
+        MX_BLOCK = 32
+
+        T, H, D = key.shape
+        assert D % MX_BLOCK == 0, f"head_dim ({D}) must be divisible by MX block ({MX_BLOCK})"
+        num_blocks = D // MX_BLOCK
+
+        def _mx_quant_dequant(x: torch.Tensor) -> torch.Tensor:
+            # x: [T, H, D]  →  blocks: [T*H, num_blocks, MX_BLOCK]
+            blocks = x.reshape(T * H, num_blocks, MX_BLOCK)
+            amax = blocks.abs().float().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale = fp8_max / amax                      # [T*H, num_blocks, 1]
+            fp8 = (blocks.float() * scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+            return (fp8.to(x.dtype) / scale.to(x.dtype)).reshape(T, H, D)
+
+        key = _mx_quant_dequant(key)
+        value = _mx_quant_dequant(value)
+
+        # Restore sink-token positions to original BF16 (no quant noise)
+        if has_sinks:
+            sink_mask = (positions < self.N_SINK_TOKENS).unsqueeze(-1).unsqueeze(-1)
+            key = torch.where(sink_mask, original_key, key)
+            value = torch.where(sink_mask, original_value, value)
+
+        return key, value

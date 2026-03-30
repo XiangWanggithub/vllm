@@ -211,7 +211,7 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dtype = "auto"
             block_size = 16
             calculate_kv_scales = False
-        if kv_cache_dtype in ("hif8_fake", "hif8"):
+        if kv_cache_dtype in ("hif8_fake", "hif8", "fp8_fake"):
             self.fake_quant = True
             kv_cache_dtype = "auto"
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
@@ -358,8 +358,10 @@ class Attention(nn.Module, AttentionLayerBase):
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size)
-            if self.fake_quant:
-                key, value = self.quant_method.apply(key, value)
+            if self.fake_quant and getattr(self, 'quant_method', None) is not None:
+                positions = getattr(self, '_current_positions', None)
+                key, value = self.quant_method.apply(
+                    key, value, positions=positions)
             if self.use_direct_call:
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata

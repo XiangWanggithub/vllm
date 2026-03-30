@@ -38,6 +38,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "hif8": torch.float16,
     "hif8_fake": torch.float16,
+    "fp8_fake": torch.float16,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
