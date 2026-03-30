@@ -1149,20 +1149,42 @@ class HiF8FakeKVCacheMethod(BaseKVCacheMethod):
         self.quant_hif8_fake = QuantFakeHiF8(
             static=False,
             group_shape=GroupShape.PER_TOKEN,
+            use_dynamic_scale=True,
         )
+
+    # Number of leading token positions to keep in BF16 (sink tokens).
+    # GPT-OSS uses 1 sink token at position 0.
+    N_SINK_TOKENS = 1
 
     def apply(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
         scale_ub: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ):
         assert len(key.shape) == 3, "Key dim needs to be (-1, num_heads, head_dim)"
         assert len(value.shape) == 3, "Value dim needs to be (-1, num_heads, head_dim)"
+
+        # Protect sink tokens (position < N_SINK_TOKENS) from quantization
+        # noise. Uses torch.where instead of data-dependent branching to
+        # remain compatible with torch.compile / CUDA graph capture.
+        has_sinks = positions is not None and self.N_SINK_TOKENS > 0
+        if has_sinks:
+            original_key = key.clone()
+            original_value = value.clone()
+
         key, key_scales = self.quant_hif8_fake(key)
         value, value_scales = self.quant_hif8_fake(value)
         key = (key * key_scales).to(key.dtype)
         value = (value * value_scales).to(value.dtype)
+
+        # Restore sink tokens to original BF16 values (no quant noise)
+        if has_sinks:
+            # sink_mask: (num_tokens,) -> broadcast to (num_tokens, heads, dim)
+            sink_mask = (positions < self.N_SINK_TOKENS).unsqueeze(-1).unsqueeze(-1)
+            key = torch.where(sink_mask, original_key, key)
+            value = torch.where(sink_mask, original_value, value)
 
         return key, value
     

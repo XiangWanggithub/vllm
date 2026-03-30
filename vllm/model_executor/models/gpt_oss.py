@@ -135,7 +135,10 @@ class OAIAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         v = v.contiguous()
+        # Store positions for HiF8 KV cache sink token protection
+        self.attn._current_positions = positions
         attn_output = self.attn(q, k, v)
+        self.attn._current_positions = None
         output, _ = self.o_proj(attn_output)
         return output
 

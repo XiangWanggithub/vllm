@@ -22,6 +22,10 @@ class QuantFakeHiF8(CustomOp):
     This CustomOp supports both static and dynamic quantization.
     """
 
+    # Scale target for KV cache dynamic scaling: maps x_max to this value,
+    # placing the majority of values in the HiF8 3-bit sweet spot [0.125, 16).
+    _KV_SCALE_TARGET = 16.0
+
     def __init__(
         self,
         static: bool,
@@ -29,6 +33,7 @@ class QuantFakeHiF8(CustomOp):
         num_token_padding: int | None = None,
         column_major_scales: bool = False,
         use_ue8m0: bool | None = None,  # for Torch compile
+        use_dynamic_scale: bool = False,
     ):
         """
         :param static: static or dynamic quantization
@@ -38,6 +43,9 @@ class QuantFakeHiF8(CustomOp):
             size
         :param column_major_scales: For group quantization, output scales in
             column major format
+        :param use_dynamic_scale: If True, compute per-token scale from x_max
+            to map values into HiF8 sweet spot. Used by KV cache quantization.
+            If False, use scale=1.0 (direct cast, used by input quantization).
         """
         super().__init__()
         self.static = static
@@ -45,6 +53,7 @@ class QuantFakeHiF8(CustomOp):
         self.num_token_padding = num_token_padding
         self.column_major_scales = column_major_scales
         self.use_ue8m0 = use_ue8m0
+        self.use_dynamic_scale = use_dynamic_scale
 
         self.is_group_quant = group_shape.is_per_group()
         if self.is_group_quant:
@@ -94,9 +103,12 @@ class QuantFakeHiF8(CustomOp):
                 x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
                 # x_median = x.median().unsqueeze(-1).to(torch.float32)
 
-            # scale = (x_max / _HIF8_MAX).clamp(min=_HIF8_MIN_SCALING_FACTOR)
-            scale = torch.ones(x_max.shape, dtype=torch.float32, device=x_max.device)
-            # scale = x_median
+            if self.use_dynamic_scale:
+                scale = (x_max / self._KV_SCALE_TARGET).clamp(
+                    min=_HIF8_MIN_SCALING_FACTOR)
+            else:
+                scale = torch.ones(
+                    x_max.shape, dtype=torch.float32, device=x_max.device)
 
         # Even for dynamic per-token scales,
         # reciprocal performs slightly better than division
