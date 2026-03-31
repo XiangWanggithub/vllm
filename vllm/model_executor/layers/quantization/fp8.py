@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-import re
 from collections.abc import Callable
 from enum import Enum
 from functools import partial
@@ -348,13 +347,11 @@ class Fp8Config(QuantizationConfig):
             )
             if not block_quant_active:
                 return None
-            # For GPT-OSS hybrid attention: even layers use sliding-window
-            # attention (SWA) with a small context window — keep their KV
-            # cache in BF16 to avoid unnecessary quantization of a tiny
-            # buffer. Odd layers use full attention and benefit most from
-            # FP8 KV compression at long context lengths.
-            m = re.search(r'\.layers\.(\d+)\.', prefix) if prefix else None
-            if m is not None and int(m.group(1)) % 2 == 0:
+            # Skip KV quantization for sliding-window attention layers: their
+            # KV cache is tiny (window-sized), so quantization saves little
+            # memory while adding noise. layer.sliding_window is None for full
+            # attention and an integer window size for SWA.
+            if getattr(layer, 'sliding_window', None) is not None:
                 return None  # SWA layer — BF16 KV cache
             return Fp8KVCacheMethod(self)
         return None
