@@ -492,7 +492,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         self.cache_dtype = self.cache_config.cache_dtype
-        if self.cache_dtype.startswith("fp8"):
+        # fp8_fake is fake quantization — KV cache is stored in model dtype (BF16),
+        # not real FP8. The per-layer Attention.__init__ overrides kv_cache_dtype to
+        # "auto", so kv_cache_spec.dtype == model_config.dtype (both BF16).
+        if self.cache_dtype.startswith("fp8") and self.cache_dtype != "fp8_fake":
             self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
                 self.cache_dtype
             )
