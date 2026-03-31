@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import re
 from collections.abc import Callable
 from enum import Enum
 from functools import partial
@@ -16,7 +18,8 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.attention.layer import Attention
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                               get_tensor_model_parallel_world_size)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -411,7 +414,12 @@ class HiF8FakeConfig(QuantizationConfig):
             moe_quant_method = HiF8FakeMoEMethod(self, layer)
             return moe_quant_method
         elif isinstance(layer, Attention):
-            return HiF8FakeKVCacheMethod(self)
+            # Skip KV quantization for sliding-window attention layers: their
+            # KV cache is bounded by window_size (128 tokens), so quantization
+            # saves negligible memory while adding noise (confirmed harmful in v11).
+            if getattr(layer, 'sliding_window', None) is not None:
+                return None  # SWA layer — BF16 KV cache passthrough
+            return HiF8FakeKVCacheMethod(self, prefix)
         return None
 
     def get_cache_scale(self, name: str) -> str | None:
@@ -1142,15 +1150,66 @@ class HiF8FakeMoEMethod(FusedMoEMethodBase):
 class HiF8FakeKVCacheMethod(BaseKVCacheMethod):
     """
     Supports loading kv-cache scaling factors from FP8 checkpoints.
+
+    Applies per-channel static key scaling (calibrated offline) before HiF8
+    fake quantization on ALL decoder layers.  The scale tensor is loaded from
+    the path given by the env var HIFAKE_KV_KEY_SCALES_PATH.
+
+    Two tensor formats are supported (auto-detected by shape[0]):
+      - [24, n_kv_heads, head_dim] — v11 all-layers format; kscale_idx = layer_idx
+      - [12, n_kv_heads, head_dim] — v10 full-attn-only format; backward compat
     """
 
-    def __init__(self, quant_config: HiF8FakeConfig):
+    def __init__(self, quant_config: HiF8FakeConfig, prefix: str = ""):
         super().__init__(quant_config)
         self.quant_hif8_fake = QuantFakeHiF8(
             static=False,
             group_shape=GroupShape.PER_TOKEN,
             use_dynamic_scale=True,
         )
+
+        # Determine layer index from the layer prefix.
+        # Expected prefix form: "model.layers.<idx>.self_attn"
+        m = re.search(r'\.layers\.(\d+)\.', prefix)
+        self._layer_idx: int = int(m.group(1)) if m else -1
+        self._is_full_attn: bool = (self._layer_idx % 2 == 1)
+
+        # Per-channel static key scale: [n_kv_heads, head_dim], float32.
+        # Loaded once at init; GPU-resident for CUDA graph capture compatibility.
+        self._kscale: Optional[torch.Tensor] = None
+        scales_path = os.environ.get("HIFAKE_KV_KEY_SCALES_PATH", "")
+        if scales_path and os.path.isfile(scales_path) and self._layer_idx >= 0:
+            all_kscales = torch.load(scales_path, map_location="cpu",
+                                     weights_only=True)
+            n_scale_layers = all_kscales.shape[0]
+            if n_scale_layers == 24:
+                # v11 all-layers format: index directly by layer_idx (0-23)
+                kscale_idx = self._layer_idx
+                self._kscale = all_kscales[kscale_idx]
+            elif n_scale_layers == 12 and self._is_full_attn:
+                # v10 full-attn-only format: backward compat
+                # layer_idx 1,3,...,23 → kscale_idx 0,1,...,11
+                kscale_idx = (self._layer_idx - 1) // 2
+                self._kscale = all_kscales[kscale_idx]
+            # else: sliding-window layer with old format → no kscale (fallback to dynamic)
+
+            if self._kscale is not None:
+                # Shard per-channel scales across TP workers so each rank only
+                # holds scales for its local KV heads (n_kv_heads // tp_size).
+                tp_size = get_tensor_model_parallel_world_size()
+                if tp_size > 1:
+                    tp_rank = get_tensor_model_parallel_rank()
+                    n_heads = self._kscale.shape[0]
+                    local_heads = n_heads // tp_size
+                    self._kscale = self._kscale[
+                        tp_rank * local_heads:(tp_rank + 1) * local_heads
+                    ]
+                # Move to GPU immediately so CUDA graph capture does not need
+                # a CPU→GPU copy inside the captured stream (not permitted).
+                if torch.cuda.is_available():
+                    self._kscale = self._kscale.to(
+                        device=f"cuda:{torch.cuda.current_device()}"
+                    )
 
     # Number of leading token positions to keep in BF16 (sink tokens).
     # GPT-OSS uses 1 sink token at position 0.
@@ -1174,9 +1233,20 @@ class HiF8FakeKVCacheMethod(BaseKVCacheMethod):
             original_key = key.clone()
             original_value = value.clone()
 
-        key, key_scales = self.quant_hif8_fake(key)
+        if self._kscale is not None:
+            # Per-channel key scaling (v10/v11).
+            # kscale: [n_kv_heads, head_dim] → broadcast over tokens → [T, H, D]
+            kscale = self._kscale.to(device=key.device, dtype=key.dtype)
+            # Normalize so each (head, dim) channel lands in [-16, +16] = HiF8 sweet spot
+            k_norm = key / kscale.unsqueeze(0)
+            k_q, k_dyn_scale = self.quant_hif8_fake(k_norm)
+            # Dequant: restore per-token dynamic scale AND per-channel static scale
+            key = (k_q * k_dyn_scale * kscale.unsqueeze(0)).to(key.dtype)
+        else:
+            key, key_scales = self.quant_hif8_fake(key)
+            key = (key * key_scales).to(key.dtype)
+
         value, value_scales = self.quant_hif8_fake(value)
-        key = (key * key_scales).to(key.dtype)
         value = (value * value_scales).to(value.dtype)
 
         # Restore sink tokens to original BF16 values (no quant noise)
