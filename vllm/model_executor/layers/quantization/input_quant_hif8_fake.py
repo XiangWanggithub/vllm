@@ -34,6 +34,7 @@ class QuantFakeHiF8(CustomOp):
         column_major_scales: bool = False,
         use_ue8m0: bool | None = None,  # for Torch compile
         use_dynamic_scale: bool = False,
+        scale_target: float = 16.0,
     ):
         """
         :param static: static or dynamic quantization
@@ -44,8 +45,12 @@ class QuantFakeHiF8(CustomOp):
         :param column_major_scales: For group quantization, output scales in
             column major format
         :param use_dynamic_scale: If True, compute per-token scale from x_max
-            to map values into HiF8 sweet spot. Used by KV cache quantization.
-            If False, use scale=1.0 (direct cast, used by input quantization).
+            to map values into HiF8 sweet spot. Used by KV cache quantization
+            and activation quantization with scale_target != 1.0.
+            If False, use scale=1.0 (direct cast).
+        :param scale_target: When use_dynamic_scale=True, scale = x_max /
+            scale_target. Maps activations so their max lands at scale_target,
+            placing most values in the HiF8 sweet spot [0.125, scale_target).
         """
         super().__init__()
         self.static = static
@@ -54,6 +59,7 @@ class QuantFakeHiF8(CustomOp):
         self.column_major_scales = column_major_scales
         self.use_ue8m0 = use_ue8m0
         self.use_dynamic_scale = use_dynamic_scale
+        self.scale_target = scale_target
 
         self.is_group_quant = group_shape.is_per_group()
         if self.is_group_quant:
@@ -104,7 +110,7 @@ class QuantFakeHiF8(CustomOp):
                 # x_median = x.median().unsqueeze(-1).to(torch.float32)
 
             if self.use_dynamic_scale:
-                scale = (x_max / self._KV_SCALE_TARGET).clamp(
+                scale = (x_max / self.scale_target).clamp(
                     min=_HIF8_MIN_SCALING_FACTOR)
             else:
                 scale = torch.ones(

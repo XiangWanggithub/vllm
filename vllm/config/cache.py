@@ -31,6 +31,7 @@ CacheDType = Literal[
     "fp8_fake",
     "hif8",
     "hif8_fake",
+    "int8_w8a8",
 ]
 MambaDType = Literal["auto", "float32"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]

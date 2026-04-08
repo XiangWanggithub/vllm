@@ -39,6 +39,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "hif8": torch.float16,
     "hif8_fake": torch.float16,
     "fp8_fake": torch.float16,
+    "int8_w8a8": torch.float16,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {

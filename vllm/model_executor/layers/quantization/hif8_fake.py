@@ -224,6 +224,7 @@ class HiF8FakeLinearOp:
         act_quant_static: bool,
         act_quant_group_shape: GroupShape = GroupShape.PER_TENSOR,
         pad_output: bool | None = None,
+        activation_scale_factor: float = 1.0,
     ):
         self.preferred_backend = "torch"
 
@@ -243,10 +244,15 @@ class HiF8FakeLinearOp:
         self.output_padding = 17 if pad_output else None
         self.act_quant_static = act_quant_static
         self.act_quant_group_shape = act_quant_group_shape
+        # When activation_scale_factor != 1.0, use dynamic scaling to map
+        # per-token x_max to scale_target, placing activations in HiF8 sweet spot.
+        use_dynamic_scale = activation_scale_factor != 1.0
         self.quant_hif8_fake = QuantFakeHiF8(
             static=act_quant_static,
             group_shape=act_quant_group_shape,
             num_token_padding=self.output_padding,
+            use_dynamic_scale=use_dynamic_scale,
+            scale_target=activation_scale_factor,
         )
 
     def apply(
@@ -321,6 +327,7 @@ class HiF8FakeConfig(QuantizationConfig):
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] | None = None,
         per_channel: bool = False,
+        activation_scale_factor: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -330,6 +337,7 @@ class HiF8FakeConfig(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        self.activation_scale_factor = activation_scale_factor
         if weight_block_size is not None:
             if not is_checkpoint_hif8_serialized:
                 raise ValueError(
@@ -378,6 +386,8 @@ class HiF8FakeConfig(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         per_channel = cls.get_from_keys_or(config, ["per_channel"], False)
+        activation_scale_factor = cls.get_from_keys_or(
+            config, ["activation_scale_factor"], 1.0)
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
@@ -388,6 +398,7 @@ class HiF8FakeConfig(QuantizationConfig):
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             per_channel=per_channel,
+            activation_scale_factor=activation_scale_factor,
         )
 
     def get_quant_method(
@@ -489,6 +500,7 @@ class HiF8FakeLinearMethod(LinearMethodBase):
             self.hif8_fake_linear = HiF8FakeLinearOp(
                 act_quant_static=self.act_q_static,
                 act_quant_group_shape=self.act_q_group_shape,
+                activation_scale_factor=self.quant_config.activation_scale_factor,
             )
 
     def create_weights(
