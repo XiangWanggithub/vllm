@@ -32,6 +32,7 @@ QuantizationMethods = Literal[
     "bitsandbytes",
     "hqq",
     "experts_int8",
+    "int8_w8a16",
     "ipex",
     "quark",
     "moe_wna16",
@@ -115,6 +116,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .cpu_wna16 import CPUAWQConfig, CPUGPTQConfig
     from .deepspeedfp import DeepSpeedFPConfig
     from .experts_int8 import ExpertsInt8Config
+    from .int8_w8a16 import Int8W8A16Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
     from .hif8_fake import HiF8FakeConfig
@@ -161,6 +163,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "ptpc_fp8": PTPCFp8Config,
         "hqq": HQQMarlinConfig,
         "experts_int8": ExpertsInt8Config,
+        "int8_w8a16": Int8W8A16Config,
         "ipex": IPEXConfig,
         "quark": QuarkConfig,
         "moe_wna16": MoeWNA16Config,
