@@ -36,7 +36,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
-from vllm.model_executor.layers.fused_moe.layer import FUSED_MOE_UNQUANTIZED_CONFIG
+from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
