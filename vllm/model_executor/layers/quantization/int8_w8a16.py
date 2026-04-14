@@ -51,6 +51,12 @@ _INT8_MAX = 127.0
 _INT8_EPS = 1e-8
 
 
+_BF16_SKIP_SUBSTRINGS = [
+    "mlp.gate",
+    "shared_expert_gate",
+]
+
+
 class Int8W8A16Config(QuantizationConfig):
     """W8A16: INT8 weights dequantized to BF16 at runtime, BF16 activations."""
 
@@ -76,14 +82,18 @@ class Int8W8A16Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Int8W8A16Config":
-        # Called when vLLM reads quant_method=int8_w8a16 from config.json
-        # → the weights in the checkpoint are already INT8.
         return cls(from_int8_checkpoint=True)
+
+    @staticmethod
+    def _should_skip(prefix: str) -> bool:
+        return any(sub in prefix for sub in _BF16_SKIP_SUBSTRINGS)
 
     def get_quant_method(
         self, layer: Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
+            if self._should_skip(prefix):
+                return None
             if self.from_int8_checkpoint:
                 return Int8W8A16LinearFromCkptMethod(self)
             return Int8W8A16LinearMethod(self)
@@ -185,7 +195,6 @@ class Int8W8A16LinearFromCkptMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        # Dequantize int8 → BF16 and store as BF16.
         w = (layer.weight.data.float() * layer.weight_scale.data).to(torch.bfloat16)
         layer.weight = Parameter(w, requires_grad=False)
         del layer.weight_scale
@@ -263,7 +272,6 @@ class Int8W8A16MoEFromCkptMethod(FusedMoEMethodBase):
         })
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        # Dequantize int8 → params_dtype BF16 and free scale tensors.
         w13 = (layer.w13_weight.data.float()
                * layer.w13_weight_scale.data).to(layer._params_dtype)
         w2 = (layer.w2_weight.data.float()
