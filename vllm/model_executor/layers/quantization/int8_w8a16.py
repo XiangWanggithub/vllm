@@ -37,6 +37,7 @@ from torch.nn.parameter import Parameter
 
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
+from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -48,14 +49,16 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8MoEMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+)
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import set_weight_attrs
 
 _INT8_MAX = 127.0
 _INT8_EPS = 1e-8
 
-
-_BF16_SKIP_SUBSTRINGS = [
+_BF16_KEEP_LAYERS = [
     "mlp.gate",
     "shared_expert_gate",
 ]
@@ -78,7 +81,7 @@ class Int8W8A16Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80  # Ampere+; Blackwell SM100 satisfies this
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -88,15 +91,11 @@ class Int8W8A16Config(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "Int8W8A16Config":
         return cls(from_int8_checkpoint=True)
 
-    @staticmethod
-    def _should_skip(prefix: str) -> bool:
-        return any(sub in prefix for sub in _BF16_SKIP_SUBSTRINGS)
-
     def get_quant_method(
         self, layer: Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
-            if self._should_skip(prefix):
+            if is_layer_skipped(prefix, _BF16_KEEP_LAYERS, skip_with_substr=True):
                 return UnquantizedLinearMethod()
             if self.from_int8_checkpoint:
                 return Int8W8A16LinearFromCkptMethod(self)
@@ -111,7 +110,7 @@ class Int8W8A16Config(QuantizationConfig):
 # ── Mode 1: BF16 checkpoint → quantize in process_weights_after_loading ─────
 
 class Int8W8A16LinearMethod(LinearMethodBase):
-    """Load BF16, quantize to INT8 in memory, dequantize in apply."""
+    """Load BF16, quantize to INT8 in memory, dequantize once after loading."""
 
     def __init__(self, quant_config: Int8W8A16Config):
         self.quant_config = quant_config
@@ -143,13 +142,12 @@ class Int8W8A16LinearMethod(LinearMethodBase):
         amax = w.abs().amax(dim=1, keepdim=True).clamp(min=_INT8_EPS)
         scale = amax / _INT8_MAX
         w_int8 = (w / scale).round().clamp(-128, 127).to(torch.int8)
-        layer.weight = Parameter(w_int8, requires_grad=False)
-        layer.weight_scale = Parameter(scale.to(torch.float32), requires_grad=False)
+        w_deq = (w_int8.float() * scale).to(torch.bfloat16)
+        layer.weight = Parameter(w_deq, requires_grad=False)
 
     def apply(self, layer: Module, x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        w = (layer.weight.float() * layer.weight_scale).to(x.dtype)
-        return F.linear(x, w, bias)
+        return F.linear(x, layer.weight.to(x.dtype), bias)
 
 
 # ── Mode 2: INT8 checkpoint → load directly, dequantize after loading ────────
@@ -172,7 +170,6 @@ class Int8W8A16LinearFromCkptMethod(LinearMethodBase):
     ):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        # Register weight as int8 — the checkpoint contains int8 tensors.
         weight = ModelWeightParameter(
             data=torch.empty(
                 sum(output_partition_sizes),
@@ -185,7 +182,6 @@ class Int8W8A16LinearFromCkptMethod(LinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-        # Scale: [out, 1] float32
         weight_scale = ModelWeightParameter(
             data=torch.ones(
                 sum(output_partition_sizes),
@@ -230,10 +226,8 @@ class Int8W8A16MoEFromCkptMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer._params_dtype = params_dtype
         weight_loader = extra_weight_attrs["weight_loader"]
 
-        # ── int8 weight tensors ──────────────────────────────────────────────
         w13_weight = Parameter(
             torch.empty(num_experts, 2 * intermediate_size_per_partition,
                         hidden_size, dtype=torch.int8),
@@ -250,36 +244,34 @@ class Int8W8A16MoEFromCkptMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        # ── float32 scale tensors ────────────────────────────────────────────
-        # quant_method="channel" tells FusedMoE.weight_loader to use
-        # _load_per_channel_weight_scale, which correctly stacks per-expert
-        # [inter, 1] scales into [E, 2*inter, 1] via _load_w13.
+        # quant_method="channel" triggers _load_per_channel_weight_scale in
+        # FusedMoE.weight_loader, which stacks per-expert [inter, 1] scales
+        # into [E, 2*inter, 1] via _load_w13.
+        scale_attrs = {
+            "weight_loader": weight_loader,
+            "quant_method": FusedMoeWeightScaleSupported.CHANNEL.value,
+        }
+
         w13_weight_scale = Parameter(
             torch.ones(num_experts, 2 * intermediate_size_per_partition, 1,
                        dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, {
-            "weight_loader": weight_loader,
-            "quant_method": "channel",   # triggers _load_per_channel_weight_scale
-        })
+        set_weight_attrs(w13_weight_scale, scale_attrs)
 
         w2_weight_scale = Parameter(
             torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, {
-            "weight_loader": weight_loader,
-            "quant_method": "channel",
-        })
+        set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         w13 = (layer.w13_weight.data.float()
-               * layer.w13_weight_scale.data).to(layer._params_dtype)
+               * layer.w13_weight_scale.data).to(torch.bfloat16)
         w2 = (layer.w2_weight.data.float()
-              * layer.w2_weight_scale.data).to(layer._params_dtype)
+              * layer.w2_weight_scale.data).to(torch.bfloat16)
         layer.w13_weight = Parameter(w13, requires_grad=False)
         layer.w2_weight = Parameter(w2, requires_grad=False)
         del layer.w13_weight_scale, layer.w2_weight_scale
