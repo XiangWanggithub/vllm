@@ -37,7 +37,11 @@ from torch.nn.parameter import Parameter
 
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
 from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -93,7 +97,7 @@ class Int8W8A16Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
             if self._should_skip(prefix):
-                return None
+                return UnquantizedLinearMethod()
             if self.from_int8_checkpoint:
                 return Int8W8A16LinearFromCkptMethod(self)
             return Int8W8A16LinearMethod(self)
